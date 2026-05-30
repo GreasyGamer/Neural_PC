@@ -5,7 +5,7 @@
 > Runs Qwen out of the box — swap in any GGUF-compatible model your PC can handle.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-green?style=flat-square&logo=python)
-![Platform](https://img.shields.io/badge/Platform-Windows-blue?style=flat-square&logo=windows)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Mac%20%7C%20Linux-blue?style=flat-square)
 ![Offline](https://img.shields.io/badge/Mode-100%25%20Offline-brightgreen?style=flat-square)
 ![CUDA](https://img.shields.io/badge/GPU-CUDA%20Accelerated-76b900?style=flat-square&logo=nvidia)
 ![License](https://img.shields.io/badge/License-MIT-orange?style=flat-square)
@@ -51,6 +51,20 @@ Same interface, same commands, same philosophy. More power.
 - **Chat logging** — saves conversations as `.json` and `.txt`
 - **ASCII avatar** — reacts to what you're doing
 - **GRID Pong** — play pong against your AI companion with live LLM banter (`/pong`)
+
+---
+
+## Platform Support
+
+| Feature | Windows | macOS | Linux |
+|---|---|---|---|
+| Local inference | ✅ | ✅ | ✅ |
+| GPU acceleration (CUDA) | ✅ | ✅ | ✅ |
+| Hardware auto-detection | ✅ | ✅ | ✅ |
+| All commands & modes | ✅ | ✅ | ✅ |
+| Voice output (`/voice`) | ✅ | ❌ | ❌ |
+
+Voice output uses Windows SAPI (`pywin32`) and is the only Windows-exclusive feature. On Mac/Linux the app runs fully — `/voice` is silently disabled. The `pywin32` package is skipped automatically on non-Windows installs.
 
 ---
 
@@ -169,7 +183,7 @@ pip install -r requirements.txt
 
 Launch with `python neural_pc.py`. On first run, hardware is auto-detected — CPU, GPU name, VRAM, and GPU layers are all set automatically. Use `/setmodels` to point the app at your models folder, or edit `config.json` directly.
 
-For GPU support install the CUDA build of llama-cpp-python (see GPU section above).
+For GPU support install the CUDA build of llama-cpp-python (see GPU section above). On Mac/Linux, `pywin32` is skipped automatically — no manual changes needed.
 
 ---
 
