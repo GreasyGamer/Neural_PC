@@ -1,7 +1,4 @@
 llama-cpp-python
 psutil
 pyspellchecker
-
-# Windows only — TTS voice output (/voice command)
-# Automatically skipped on Mac/Linux, voice will be disabled
-pywin32; sys_platform == "win32"
+pywin32; platform_system == "Windows"
