@@ -35,15 +35,16 @@ except ImportError:
 # ────────────────────────────────────────────────
 # VERSION & DEBUG
 # ────────────────────────────────────────────────
-VERSION    = "1.0.0"
-BUILD_DATE = "5-29-2026"
+VERSION    = "1.0.1"
+BUILD_DATE = "5-30-2026"
 DEBUG      = False  # Set True to enable debug output in console
 
+# Cached at import — used in model loading and boot display
+_CPU_COUNT = multiprocessing.cpu_count()
+
 # ════════════════════════════════════════════════
-#  EDIT THESE TO MATCH YOUR SETUP
-#  (These are the fallback defaults — MODELS_DIR
-#   will be saved to config.json after first run
-#   and can also be changed via /setmodels)
+#  PATHS — auto-detected at startup, saved to config.json
+#  Change models folder via /setmodels inside the app
 # ════════════════════════════════════════════════
 
 def _resolve_default_models_dir() -> str:
@@ -86,7 +87,7 @@ def detect_cpu_name() -> str:
                         return line.split(":", 1)[1].strip()
     except Exception:
         pass
-    return f"{multiprocessing.cpu_count()}-core CPU"
+    return f"{_CPU_COUNT}-core CPU"
 
 
 def detect_gpu_name() -> str:
@@ -617,7 +618,7 @@ def get_system_info():
         ram_gb        = mem.total     / (1024**3)
         ram_used      = mem.used      / (1024**3)
         ram_available = mem.available / (1024**3)
-        cpu_count     = multiprocessing.cpu_count()
+        cpu_count     = _CPU_COUNT
         cpu_percent   = psutil.cpu_percent(interval=0.1)
         return ram_gb, cpu_count, ram_used, ram_available, cpu_percent
     except Exception:
@@ -625,22 +626,21 @@ def get_system_info():
 
 def recommend_model():
     ram_gb, cpu_count, _, _, _ = get_system_info()
-    # Try models in preferred order; pick the first one found on disk
-    for tier in ["champ", "reasoning", "deep", "balanced", "fast"]:
+    # Pick best model that fits in RAM AND exists on disk
+    ram_tiers = []
+    if ram_gb >= 18: ram_tiers = ["reasoning", "champ", "deep", "balanced", "fast"]
+    elif ram_gb >= 14: ram_tiers = ["champ", "deep", "balanced", "fast"]
+    elif ram_gb >= 10: ram_tiers = ["deep", "balanced", "fast"]
+    elif ram_gb >= 6:  ram_tiers = ["balanced", "fast"]
+    else:              ram_tiers = ["fast"]
+
+    for tier in ram_tiers:
         if os.path.exists(MODELS[tier]["path"]):
-            return tier, f"Auto-selected {tier.upper()} (found on disk)", ram_gb, cpu_count
-    # Fallback by RAM if nothing found yet
-    if ram_gb >= 18:
-        recommended = "reasoning"
-    elif ram_gb >= 14:
-        recommended = "champ"
-    elif ram_gb >= 10:
-        recommended = "deep"
-    elif ram_gb >= 6:
-        recommended = "balanced"
-    else:
-        recommended = "fast"
-    return recommended, f"Recommended by RAM ({ram_gb:.1f}GB)", ram_gb, cpu_count
+            return tier, f"Auto-selected {tier.upper()} (RAM: {ram_gb:.1f}GB, found on disk)", ram_gb, cpu_count
+
+    # Nothing found on disk — just recommend by RAM so boot message is informative
+    recommended = ram_tiers[0]
+    return recommended, f"Recommended by RAM ({ram_gb:.1f}GB) — model not found on disk", ram_gb, cpu_count
 
 # ────────────────────────────────────────────────
 # PROMPTS
@@ -872,13 +872,12 @@ def load_model_async(tier, gpu_layers=None):
             del llm
             llm = None
             gc.collect()
-            time.sleep(1)
 
         model_loaded = False
         ctx_size     = MODELS[tier].get("ctx", 8192)
 
         update_status(f"[*] Loading {MODELS[tier]['name']}...")
-        update_status(f"[*] GPU layers: {gpu_layers} | Context: {ctx_size} | Threads: {max(1, multiprocessing.cpu_count() - 2)}")
+        update_status(f"[*] GPU layers: {gpu_layers} | Context: {ctx_size} | Threads: {max(1, _CPU_COUNT - 2)}")
         update_status("[*] This may take 30-90 seconds for large models...")
 
         if avatar is not None:
@@ -887,7 +886,7 @@ def load_model_async(tier, gpu_layers=None):
         llm = Llama(
             model_path=MODELS[tier]["path"],
             n_ctx=ctx_size,
-            n_threads=max(1, multiprocessing.cpu_count() - 2),
+            n_threads=max(1, _CPU_COUNT - 2),
             n_gpu_layers=gpu_layers,
             n_batch=512,
             verbose=False
@@ -897,9 +896,8 @@ def load_model_async(tier, gpu_layers=None):
         current_model_tier = tier
         model_loaded       = True
         update_status(f"[+] {MODELS[tier]['name']} online. GPU layers: {gpu_layers}")
-        enable_input()
+        root.after(0, enable_input)   # must touch tkinter widgets from main thread
         root.after(0, update_header)
-
         if avatar is not None:
             root.after(0, lambda: avatar.set_state("idle"))
 
@@ -907,8 +905,7 @@ def load_model_async(tier, gpu_layers=None):
         model_loaded = False
         update_status(f"[ERROR] Failed to load model:\n{str(e)}")
         update_status("[HINT] If VRAM OOM: try /gpu 10 or /gpu 0 to reduce GPU layers")
-        # Re-enable input so the user isn't stuck
-        enable_input()
+        root.after(0, enable_input)   # must touch tkinter widgets from main thread
         if avatar is not None:
             root.after(0, lambda: avatar.set_state("error"))
 
@@ -988,26 +985,50 @@ def trim_context():
         response_queue.put(("system", "[SYSTEM] ⚠ Memory purged — context rolled back. Rebuilding from last exchanges."))
 
 # ────────────────────────────────────────────────
-# SPELL CHECK  (debounced)
+# SPELL CHECK  (properly debounced — runs after typing pause)
 # ────────────────────────────────────────────────
-_last_spell_text = ""
+_last_spell_text  = ""
+_spell_after_id   = None
+_SPELL_DELAY_MS   = 300  # ms to wait after last keypress before checking
 
 def check_spelling(event=None):
-    global suggestion_frame, _last_spell_text
+    """Debounce entry point — cancels any pending check and reschedules."""
+    global _spell_after_id, _last_spell_text
 
     text = input_box.get().strip()
 
-    # Skip if text hasn't changed — avoids firing on modifier/arrow keys
-    if text == _last_spell_text:
-        return
-    _last_spell_text = text
-
-    # Avatar reacts to typing — only when model is idle
+    # Avatar reacts to typing immediately — lightweight, no spell work here
     if avatar is not None and not _is_generating.is_set():
         if text:
             avatar.set_state("typing")
         else:
             avatar.set_state("idle")
+
+    # Cancel previous pending spell check
+    if _spell_after_id is not None:
+        root.after_cancel(_spell_after_id)
+        _spell_after_id = None
+
+    # Skip early if nothing useful to check
+    if not text or text.startswith("/") or not model_loaded:
+        hide_suggestions()
+        _last_spell_text = text
+        return
+
+    # Schedule the actual spell work after the delay
+    _spell_after_id = root.after(_SPELL_DELAY_MS, _run_spell_check)
+
+def _run_spell_check():
+    """Runs only after typing has paused — does the actual CPU work."""
+    global _last_spell_text, _spell_after_id
+    _spell_after_id = None
+
+    text = input_box.get().strip()
+
+    # Skip if text hasn't changed since last check
+    if text == _last_spell_text:
+        return
+    _last_spell_text = text
 
     if not text or text.startswith("/") or not model_loaded:
         hide_suggestions()
@@ -1018,8 +1039,13 @@ def check_spelling(event=None):
         hide_suggestions()
         return
 
-    last_word = words[-1].lower()
-    if len(last_word) < 3 or last_word.isdigit():
+    last_word = words[-1].lower().strip('.,!?;:\'"-()')
+    # Hide if word ends with punctuation (user finished the word) or too short
+    if not last_word or len(last_word) < 3 or last_word.isdigit():
+        hide_suggestions()
+        return
+    # Hide if the original token ended with punctuation — word is complete
+    if words[-1][-1] in ".,!?;:":
         hide_suggestions()
         return
 
@@ -1093,6 +1119,8 @@ def replace_word(old_word, new_word):
 # ────────────────────────────────────────────────
 def save_chat_log():
     try:
+        if not current_model_tier:
+            return False, "No model loaded — nothing to save."
         now       = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H%M%S")
         filename  = f"chat_{current_mode}_{current_model_tier}_{timestamp}.json"
@@ -1449,8 +1477,21 @@ def check_response_queue():
                     avatar.set_state("thinking")
 
             elif status == "stream_token":
+                # Batch: drain all consecutive tokens in one config(NORMAL)/config(DISABLED) pair
+                batch = data
+                try:
+                    while True:
+                        s2, d2 = response_queue.get_nowait()
+                        if s2 == "stream_token":
+                            batch += d2
+                        else:
+                            # Non-token item — put it back by breaking and handling below
+                            response_queue.put((s2, d2))
+                            break
+                except Empty:
+                    pass
                 chat_box.config(state=tk.NORMAL)
-                chat_box.insert(tk.END, data, "ai_text")
+                chat_box.insert(tk.END, batch, "ai_text")
                 chat_box.see(tk.END)
                 chat_box.config(state=tk.DISABLED)
 
@@ -1486,7 +1527,15 @@ def check_response_queue():
 
     except Empty:
         if _is_generating.is_set():
-            root.after(30, check_response_queue)
+            # Back off slightly if nothing arrived — avoids hammering when model is slow to start
+            root.after(50, check_response_queue)
+    except Exception as e:
+        # Any unexpected error in queue processing — re-enable input so UI isn't stuck
+        if DEBUG:
+            print(f"[Queue Error] {e}")
+        enable_input()
+        if avatar is not None:
+            root.after(0, lambda: avatar.set_state("error"))
 
 # ────────────────────────────────────────────────
 # UI INPUT
@@ -1567,7 +1616,7 @@ def update_status(message):
         chat_box.insert(tk.END, f"{message}\n")
         chat_box.see(tk.END)
         chat_box.config(state=tk.DISABLED)
-        root.update()
+        # root.update() removed — not thread-safe; root.after(0,...) is sufficient
     root.after(0, _update)
 
 def update_header():
@@ -1820,7 +1869,7 @@ chat_box.tag_config("error_tag",   foreground="#ff3333")
 # ── Status bar — pack BOTTOM first ───────────────
 status_bar = tk.Label(
     root,
-    text=f"Models: {DEFAULT_MODELS_DIR}  |  Logs: {DEFAULT_CHAT_LOGS}  |  /help for commands",
+    text="Initializing...",
     bg="#001100", fg="#005500",
     font=("Courier New", 8),
     anchor="w", padx=10
@@ -1932,10 +1981,17 @@ def startup_sequence():
     chat_box.insert(tk.END, "\n")
 
     if not found_any:
-        chat_box.insert(tk.END, "[CRITICAL] No models found!\n", "command_tag")
-        chat_box.insert(tk.END, f"[*] Put .gguf files in: {MODELS_DIR}\n")
-        chat_box.insert(tk.END, "[*] Or use /setmodels to browse to your models folder\n")
+        chat_box.insert(tk.END, "[!] No .gguf models found in:\n", "command_tag")
+        chat_box.insert(tk.END, f"    {MODELS_DIR}\n\n")
+        chat_box.insert(tk.END, "  To get started:\n")
+        chat_box.insert(tk.END, "  1. Download a .gguf model from HuggingFace\n")
+        chat_box.insert(tk.END, "     Recommended: Qwen2.5-3B-Q4_K_M.gguf (fast, ~2GB)\n")
+        chat_box.insert(tk.END, "                  Qwen3-8B-Q4_K_M.gguf   (balanced, ~5GB)\n\n")
+        chat_box.insert(tk.END, "  2. Drop the .gguf file into the folder above\n")
+        chat_box.insert(tk.END, "     OR type /setmodels to point to a different folder\n\n")
+        chat_box.insert(tk.END, "  3. Type /reload to scan again without restarting\n\n")
         chat_box.config(state=tk.DISABLED)
+        enable_input()   # keep input active so /setmodels and /reload work
         update_header()
         return
 
@@ -1952,5 +2008,32 @@ def startup_sequence():
     periodic_header_update()
     draw_scanlines()
 
+def on_close():
+    """Clean shutdown — stop generation, flush TTS, then exit."""
+    # Stop any active inference
+    if _is_generating.is_set():
+        _is_generating.clear()
+
+    # Flush and silence TTS
+    try:
+        stop_speaking()
+    except Exception:
+        pass
+
+    # Send TTS worker shutdown sentinel
+    try:
+        _tts_chunk_queue.put(None)
+    except Exception:
+        pass
+
+    # Save config on exit
+    try:
+        save_config()
+    except Exception:
+        pass
+
+    root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_close)
 root.after(100, startup_sequence)
 root.mainloop()
