@@ -22,6 +22,14 @@ try:
 except ImportError:
     _WIN32COM_AVAILABLE = False
 
+try:
+    import pynvml as _pynvml
+    _pynvml.nvmlInit()
+    _PYNVML_AVAILABLE = True
+except Exception:
+    _pynvml          = None
+    _PYNVML_AVAILABLE = False
+
 # ────────────────────────────────────────────────
 # ██████╗  ██████╗    ██████╗ ██████╗ ██╗██████╗
 # ██╔══██╗██╔════╝   ██╔════╝██╔══██╗██║██╔══██╗
@@ -623,6 +631,73 @@ def get_system_info():
         return ram_gb, cpu_count, ram_used, ram_available, cpu_percent
     except Exception:
         return 64, 24, 0, 64, 0
+
+# ────────────────────────────────────────────────
+# GPU MONITOR  (pynvml polling — background thread)
+# ────────────────────────────────────────────────
+_gpu_stats: dict = {
+    "vram_used_gb":  0.0,
+    "vram_total_gb": 0.0,
+    "vram_pct":      0.0,
+    "gpu_util_pct":  0.0,
+    "gpu_temp_c":    0.0,
+    "tps":           0.0,
+}
+_gpu_monitor_running = False
+_gpu_monitor_lock    = threading.Lock()
+
+def get_gpu_stats() -> dict:
+    with _gpu_monitor_lock:
+        return dict(_gpu_stats)
+
+def gpu_stats_json() -> str:
+    """Return current GPU + TPS stats as a JSON string."""
+    return json.dumps(get_gpu_stats())
+
+def update_tps(tps: float):
+    with _gpu_monitor_lock:
+        _gpu_stats["tps"] = round(tps, 1)
+
+def reset_tps():
+    with _gpu_monitor_lock:
+        _gpu_stats["tps"] = 0.0
+
+def _gpu_monitor_worker(interval: float = 1.0):
+    global _gpu_stats
+    if not _PYNVML_AVAILABLE:
+        return
+    try:
+        handle = _pynvml.nvmlDeviceGetHandleByIndex(0)
+    except Exception:
+        return
+    while _gpu_monitor_running:
+        try:
+            mem      = _pynvml.nvmlDeviceGetMemoryInfo(handle)
+            util     = _pynvml.nvmlDeviceGetUtilizationRates(handle)
+            temp     = _pynvml.nvmlDeviceGetTemperature(handle, _pynvml.NVML_TEMPERATURE_GPU)
+            used_gb  = mem.used  / (1024 ** 3)
+            total_gb = mem.total / (1024 ** 3)
+            pct      = (mem.used / mem.total * 100) if mem.total > 0 else 0.0
+            with _gpu_monitor_lock:
+                _gpu_stats["vram_used_gb"]  = round(used_gb,  2)
+                _gpu_stats["vram_total_gb"] = round(total_gb, 2)
+                _gpu_stats["vram_pct"]      = round(pct, 1)
+                _gpu_stats["gpu_util_pct"]  = float(util.gpu)
+                _gpu_stats["gpu_temp_c"]    = float(temp)
+        except Exception:
+            pass
+        time.sleep(interval)
+
+def start_gpu_monitor(interval: float = 1.0):
+    global _gpu_monitor_running
+    if not _PYNVML_AVAILABLE or _gpu_monitor_running:
+        return
+    _gpu_monitor_running = True
+    threading.Thread(target=_gpu_monitor_worker, args=(interval,), daemon=True).start()
+
+def stop_gpu_monitor():
+    global _gpu_monitor_running
+    _gpu_monitor_running = False
 
 def recommend_model():
     ram_gb, cpu_count, _, _, _ = get_system_info()
@@ -1420,11 +1495,14 @@ def run_inference(user_message):
     global messages
     _is_generating.set()
     _stop_generation.clear()
+    reset_tps()
 
     messages.append({"role": "user", "content": user_message})
 
     try:
         full_response = ""
+        token_count   = 0
+        gen_start     = time.time()
         response_queue.put(("stream_start", ""))
 
         for chunk in llm.create_chat_completion(
@@ -1444,8 +1522,14 @@ def run_inference(user_message):
             token = delta.get("content", "")
             if token:
                 full_response += token
+                token_count   += 1
                 response_queue.put(("stream_token", token))
                 tts_feed_token(token)
+                # Update TPS every 5 tokens to keep lock contention low
+                if token_count % 5 == 0:
+                    elapsed = time.time() - gen_start
+                    if elapsed > 0:
+                        update_tps(token_count / elapsed)
 
         # Choose cleaner based on mode
         if current_mode == "uncensored":
@@ -1671,10 +1755,11 @@ def apply_theme(theme_name: str) -> bool:
     input_frame.configure(bg=t["bg_dark"])
     scanline.configure(bg=t["bg_dark"])
 
-    # Header, accent line, status bar
+    # Header, accent line, status bar, gpu overlay
     header.configure(bg=t["bg_header"], fg=t["fg_main"])
     accent_line.configure(bg=t["accent"])
     status_bar.configure(bg=t["bg_header"], fg=t["fg_status"])
+    gpu_overlay.configure(bg=t["bg_header"], fg=t["fg_status"])
 
     # Font toolbar
     toolbar.configure(bg=t["bg_header"])
@@ -1841,6 +1926,40 @@ font_btn.pack(side=tk.LEFT, pady=1)
 font_btn.bind("<Enter>", lambda e: font_btn.config(fg="#00ff41"))
 font_btn.bind("<Leave>", lambda e: font_btn.config(fg="#005500"))
 
+# ── GPU overlay bar ──────────────────────────────
+gpu_overlay = tk.Label(
+    root,
+    text="GPU: initializing...",
+    bg="#001100", fg="#005500",
+    font=("Courier New", 8),
+    anchor="w", padx=10
+)
+gpu_overlay.pack(fill=tk.X)
+
+def update_gpu_overlay():
+    if not _PYNVML_AVAILABLE:
+        gpu_overlay.config(text="GPU monitor: install pynvml to enable  |  pip install pynvml")
+        return
+    s   = get_gpu_stats()
+    t   = THEMES[current_theme]
+    tps = s["tps"]
+    txt = (
+        f"VRAM: {s['vram_used_gb']:.1f}/{s['vram_total_gb']:.1f}GB "
+        f"({s['vram_pct']:.0f}%)  |  "
+        f"Util: {s['gpu_util_pct']:.0f}%  |  "
+        f"Temp: {s['gpu_temp_c']:.0f}C"
+        + (f"  |  TPS: {tps:.1f}" if tps > 0 else "")
+    )
+    temp = s["gpu_temp_c"]
+    if temp >= 85:
+        fg = t["fg_error"]
+    elif temp >= 70:
+        fg = t["fg_command"]
+    else:
+        fg = t["fg_status"]
+    gpu_overlay.config(text=txt, fg=fg, bg=t["bg_header"])
+    root.after(1000, update_gpu_overlay)
+
 # ── Chat box ─────────────────────────────────────
 chat_box = scrolledtext.ScrolledText(
     root,
@@ -2003,6 +2122,10 @@ def startup_sequence():
     messages = [{"role": "system", "content": PROMPTS[current_mode]}]
 
     threading.Thread(target=load_model_async, args=(recommended_tier, current_gpu_layers), daemon=True).start()
+
+    # Start GPU monitor + overlay
+    start_gpu_monitor(interval=1.0)
+    root.after(1200, update_gpu_overlay)
 
     # periodic_header_update calls update_header immediately then reschedules itself
     periodic_header_update()
